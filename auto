@@ -1,0 +1,607 @@
+local g = (type(getgenv) == "function" and getgenv()) or getfenv()
+
+-- Jalankan ulang? matikan dulu GUI/loop lama supaya tidak menumpuk.
+if g._BarberAFK_Cleanup then
+    pcall(g._BarberAFK_Cleanup)
+    g._BarberAFK_Cleanup = nil
+end
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CutStation = require(ReplicatedStorage.HairLab.Client.CutStation)
+local ClipTok = require(ReplicatedStorage.HairLab.Client.ClipTok)
+local Finish = require(ReplicatedStorage.HairLab.Client.Finish)
+local Depth = require(ReplicatedStorage.HairLab.Depth)
+local Remotes = ReplicatedStorage.HairLab.Remotes
+local NewCustomer = Remotes and Remotes:FindFirstChild("NewCustomer")
+local audio = debug.getupvalue(ClipTok._press, 2)
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
+local window = Rayfield:CreateWindow({
+    name = "Barber Empire",
+    subtitle = "Full AFK",
+    sidebarLayout = true,
+    theme = "cobalt",
+})
+
+local origApply = Finish.apply
+local origChoose = Finish.choose
+
+local lastOrder = nil
+local autoRecommend = false
+local autoFinishApply = false
+
+local autoProduct = false
+local skipProduct = false
+local selectedProducts = {}
+local productCursor = 0
+local lastProductAction = 0
+
+local enabled = false
+local busy = false
+local lastDone = 0
+local lastAttempt = 0
+local activeSince = 0
+local armed = true
+local cutsAtDone = -1
+
+local autoNext = false
+local lastNext = 0
+
+local autoPost = false
+local skipVideo = false
+local lastVideoAction = 0
+
+local alive = true
+local connections = {}
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    connections[#connections + 1] = c
+    return c
+end
+
+local function isAlive()
+    return alive
+end
+
+g._BarberAFK_Cleanup = function()
+    alive = false
+    for _, c in ipairs(connections) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    connections = {}
+    pcall(function()
+        Finish.apply = origApply
+        Finish.choose = origChoose
+    end)
+    pcall(function()
+        if type(window) == "table" and type(window.Unload) == "function" then
+            window:Unload()
+        end
+    end)
+    g._BarberAFK_Cleanup = nil
+end
+
+local function notify(title, content, duration)
+    pcall(function()
+        window:Notify({ title = title, content = content, duration = duration or 2 })
+    end)
+end
+
+Finish.choose = function(head, order, ...)
+    lastOrder = order
+    return origChoose(head, order, ...)
+end
+
+Finish.apply = function(...)
+    if autoFinishApply then
+        return 1
+    end
+    return origApply(...)
+end
+
+local tabAuto = window:CreateTab({ name = "Auto Cut" })
+local tabProduct = window:CreateTab({ name = "Product" })
+local tabVideo = window:CreateTab({ name = "Video" })
+
+local productById = {
+    ["Hair Wax"] = "Wax",
+    ["Hold Spray"] = "Spray",
+    ["Beard Oil"] = "BeardOil",
+    ["Aftershave"] = "Aftershave",
+    ["Hot Towel"] = "HotTowel",
+    ["Pomade"] = "Pomade",
+    ["Gold Serum"] = "GoldSerum",
+}
+
+local productOptions = {
+    "Hair Wax",
+    "Hold Spray",
+    "Beard Oil",
+    "Aftershave",
+    "Hot Towel",
+    "Pomade",
+    "Gold Serum",
+}
+
+local function pressDone()
+    local ui = CutStation.ui()
+    local btn = ui and ui.done and ui.done:FindFirstChild("Face")
+    if not btn then
+        return false
+    end
+
+    for _, connection in ipairs(getconnections(btn.Activated)) do
+        local fn = connection.Function
+        if type(fn) == "function" and debug.getinfo(fn).nups == 2 then
+            local up1 = debug.getupvalue(fn, 1)
+            local up2 = debug.getupvalue(fn, 2)
+            if type(up1) == "boolean" and type(up2) == "function" then
+                task.spawn(fn)
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function getCuts()
+    local player = game.Players.LocalPlayer
+    local stats = player and player:FindFirstChild("leaderstats")
+    local cuts = stats and stats:FindFirstChild("Cuts")
+    return cuts and cuts.Value or -1
+end
+
+local function doCut()
+    if busy then
+        return
+    end
+    busy = true
+
+    task.spawn(function()
+        local pressed = false
+        local ok, err = pcall(function()
+            task.wait(0.25)
+
+            if not isAlive() or not enabled or not CutStation.isActive() then
+                return
+            end
+
+            CutStation.autoPerfect()
+            task.wait(0.15)
+
+            if not isAlive() or not enabled or not CutStation.isActive() then
+                return
+            end
+
+            pressed = pressDone()
+            if pressed then
+                lastDone = os.clock()
+            end
+        end)
+
+        if not ok then
+            notify("AutoCut", "Error: " .. tostring(err), 2)
+        end
+
+        -- Gagal DONE? langsung buka latch supaya retry, tidak perlu off/on.
+        if not pressed then
+            cutsAtDone = -1
+            armed = true
+        end
+
+        busy = false
+
+        if pressed then
+            notify("AutoCut", "Perfect + DONE", 2)
+        end
+    end)
+end
+
+local function handleCut()
+    if busy then
+        return
+    end
+
+    local active = false
+    pcall(function()
+        active = CutStation.isActive()
+    end)
+
+    local cuts = getCuts()
+
+    if not active then
+        activeSince = 0
+        if cutsAtDone < 0 or cuts > cutsAtDone then
+            armed = true
+        end
+        return
+    end
+
+    if activeSince == 0 then
+        activeSince = os.clock()
+    end
+
+    -- Watchdog 1: customer lama sudah dibayar (cuts naik) tapi latch belum reset.
+    if not armed and cutsAtDone >= 0 and cuts > cutsAtDone
+        and os.clock() - lastDone > 3 then
+        armed = true
+    end
+
+    -- Watchdog 2: customer aktif lama tapi cuts tidak bertambah = DONE gagal.
+    if not armed and cutsAtDone >= 0 and cuts == cutsAtDone
+        and os.clock() - activeSince > 8 then
+        armed = true
+    end
+
+    if not armed or os.clock() - lastDone < 5 or os.clock() - lastAttempt < 1.2 then
+        return
+    end
+
+    lastAttempt = os.clock()
+    cutsAtDone = cuts
+    armed = false
+    doCut()
+end
+
+local function handleNext()
+    if not autoNext then
+        return
+    end
+    if os.clock() - lastNext < 6 or os.clock() - lastDone < 3 then
+        return
+    end
+
+    local active, video, dialog = false, false, false
+    pcall(function()
+        active = CutStation.isActive()
+        video = ClipTok.isOpen()
+        dialog = debug.getupvalue(origChoose, 11) == true
+    end)
+
+    if active or video or dialog then
+        return
+    end
+
+    lastNext = os.clock()
+    task.spawn(function()
+        if type(audio) == "table" and type(audio.nextCustomer) == "function" then
+            pcall(audio.nextCustomer)
+        end
+
+        -- Kalau 6 detik masih sepi, baru paksa lewat remote.
+        task.wait(6)
+        local active = false
+        pcall(function()
+            active = CutStation.isActive()
+        end)
+        if not active and NewCustomer then
+            local ok, err = pcall(function()
+                return NewCustomer:InvokeServer()
+            end)
+            if not ok then
+                notify("Auto Next", "Gagal: " .. tostring(err), 2)
+            end
+        end
+    end)
+end
+
+local function getUses()
+    local ok, uses = pcall(function()
+        return Finish.uses()
+    end)
+    if ok and type(uses) == "table" then
+        return uses
+    end
+    return nil
+end
+
+local function pickRecommended(uses)
+    local wants = lastOrder and lastOrder.wants
+    if wants and Depth.PRODUCT_BY_ID[wants] and (uses[wants] or 0) > 0 then
+        return wants, true
+    end
+
+    local best, bestViews = nil, -1
+    for _, product in ipairs(Depth.PRODUCTS) do
+        local id = product.id
+        if (uses[id] or 0) > 0 and (product.views or 0) > bestViews then
+            best = id
+            bestViews = product.views or 0
+        end
+    end
+
+    return best, false
+end
+
+local function handleProductDialog()
+    if os.clock() - lastProductAction < 1.5 then
+        return
+    end
+
+    local open, chosen
+    pcall(function()
+        open = debug.getupvalue(origChoose, 11)
+        chosen = debug.getupvalue(origChoose, 12)
+    end)
+
+    if open ~= true or chosen ~= nil then
+        return
+    end
+
+    lastProductAction = os.clock()
+
+    local uses = getUses()
+
+    if autoRecommend and uses then
+        local pick, isWanted = pickRecommended(uses)
+        if pick then
+            local ok = pcall(function()
+                debug.setupvalue(origChoose, 12, pick)
+            end)
+            notify("Rekomendasi", (ok and "Pakai " or "Gagal pakai ") .. pick
+                .. (isWanted and " (diminta pelanggan)" or " (views terbesar)"), 2)
+            return
+        end
+    end
+
+    if autoProduct and #selectedProducts > 0 and uses then
+        for _ = 1, #selectedProducts do
+            productCursor = productCursor % #selectedProducts + 1
+            local id = selectedProducts[productCursor]
+            if (uses[id] or 0) > 0 then
+                local ok = pcall(function()
+                    debug.setupvalue(origChoose, 12, id)
+                end)
+                notify("Auto Product", (ok and "Pakai " or "Gagal pakai ") .. id, 2)
+                return
+            end
+        end
+    end
+
+    if skipProduct then
+        pcall(function()
+            debug.setupvalue(origChoose, 12, false)
+        end)
+        notify("Auto Product", "Skip product", 2)
+    end
+end
+
+local function handleVideo()
+    if os.clock() - lastVideoAction < 2 then
+        return
+    end
+
+    local open, ready, posted = false, false, false
+    pcall(function()
+        open = ClipTok.isOpen()
+        local ui = ClipTok.ui()
+        ready = ui and ui.ready == true
+        posted = ui and ui.posted == true
+    end)
+
+    if not open then
+        return
+    end
+
+    if ready and not posted then
+        if autoPost then
+            lastVideoAction = os.clock()
+            pcall(function()
+                ClipTok._press("post")
+            end)
+            notify("Auto Post", "Posting video...", 2)
+        elseif skipVideo then
+            lastVideoAction = os.clock()
+            pcall(function()
+                ClipTok._press("skip")
+            end)
+            notify("Auto Skip", "Video discard", 2)
+        end
+        return
+    end
+
+    if posted then
+        if os.clock() - lastVideoAction < 2 then
+            return
+        end
+        lastVideoAction = os.clock()
+
+        -- Layar hasil ClipTok punya tombol NEXT CUSTOMER.
+        -- Callback aslinya: _closeResults() lalu audio.nextCustomer().
+        local closeResults = ClipTok._closeResults
+        if type(closeResults) == "function" then
+            if autoNext then
+                -- Set throttle dulu supaya handleNext tidak mengirim next dobel
+                -- di frame berikutnya setelah results ditutup.
+                lastNext = os.clock()
+                pcall(closeResults)
+                if type(audio) == "table" and type(audio.nextCustomer) == "function" then
+                    pcall(audio.nextCustomer)
+                end
+                notify("Auto Next", "Customer berikutnya", 2)
+            else
+                pcall(closeResults)
+            end
+            return
+        end
+
+        -- Results belum terpasang? Jangan pakai closeVideo kalau Auto Next ON,
+        -- nanti alur NEXT CUSTOMER-nya terlewat. Tunggu beberapa frame lagi.
+        if not autoNext then
+            local close = debug.getupvalue(ClipTok._press, 3)
+            if type(close) == "function" then
+                pcall(close)
+            end
+        end
+    end
+end
+
+connect(RunService.Heartbeat, function()
+    if not isAlive() then
+        return
+    end
+
+    if enabled then
+        handleCut()
+    end
+    handleNext()
+    if autoRecommend or autoProduct or skipProduct or autoFinishApply then
+        handleProductDialog()
+    end
+    if autoPost or skipVideo then
+        handleVideo()
+    end
+end)
+
+tabAuto:CreateToggle({
+    name = "Auto Perfect + Done",
+    description = "ON: tiap customer otomatis perfect lalu DONE. OFF: potong manual.",
+    value = false,
+    flag = "AutoCutNoPass",
+    forgetState = true,
+    callback = function(value)
+        enabled = value
+        armed = true
+        activeSince = 0
+        busy = false
+
+        if value then
+            notify("AutoCut ON", "Tiap customer akan perfect + DONE.", 3)
+        else
+            notify("AutoCut OFF", "Cut balik ke manual.", 3)
+        end
+    end,
+})
+
+tabAuto:CreateToggle({
+    name = "Auto Next Customer",
+    description = "Kalau tidak ada customer / video / dialog product, otomatis panggil customer berikutnya.",
+    value = false,
+    flag = "AutoNextCustomer",
+    forgetState = true,
+    callback = function(value)
+        autoNext = value
+        lastNext = 0
+        notify("Auto Next", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabAuto:CreateText({
+    name = "Catatan",
+    text = "Memakai CutStation.autoPerfect() + callback DONE asli, bukan remote AutoCut / DevProduct.",
+})
+
+tabProduct:CreateToggle({
+    name = "Auto Rekomendasi Produk",
+    description = "Pakai produk yang diminta pelanggan (yang hijau) kalau stok ada. Kalau tidak ada, pakai produk dengan bonus views terbesar.",
+    value = false,
+    flag = "AutoRecommendProduct",
+    forgetState = true,
+    callback = function(value)
+        autoRecommend = value
+        notify("Rekomendasi", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabProduct:CreateToggle({
+    name = "Auto Selesaikan Apply",
+    description = "Lewati mini-game rub/sweep: apply langsung selesai. Stok tetap terpakai dan cash tetap dihitung.",
+    value = false,
+    flag = "AutoFinishApply",
+    forgetState = true,
+    callback = function(value)
+        autoFinishApply = value
+        notify("Auto Apply", value and "ON - apply instan" or "OFF - apply manual", 2)
+    end,
+})
+
+tabProduct:CreateToggle({
+    name = "Auto Apply Product",
+    description = "Pakai produk dari dropdown saat dialog ADD A PRODUCT muncul. Rekomendasi diprioritaskan kalau juga ON.",
+    value = false,
+    flag = "AutoProductNoPass",
+    forgetState = true,
+    callback = function(value)
+        autoProduct = value
+        notify("Auto Product", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabProduct:CreateDropdown({
+    name = "Pilih Produk",
+    description = "Boleh pilih lebih dari satu. Produk dipakai bergilir kalau stok masih ada.",
+    options = productOptions,
+    value = {},
+    multiSelect = true,
+    flag = "AutoProductList",
+    forgetState = true,
+    callback = function(value)
+        selectedProducts = {}
+        if type(value) == "table" then
+            for _, name in ipairs(value) do
+                local id = productById[name]
+                if id then
+                    selectedProducts[#selectedProducts + 1] = id
+                end
+            end
+        elseif type(value) == "string" then
+            local id = productById[value]
+            if id then
+                selectedProducts[1] = id
+            end
+        end
+        productCursor = 0
+    end,
+})
+
+tabProduct:CreateToggle({
+    name = "Auto Skip Product",
+    description = "Kalau tidak ada produk pilihan / stok habis, lewati dialog product.",
+    value = false,
+    flag = "SkipProductNoPass",
+    forgetState = true,
+    callback = function(value)
+        skipProduct = value
+        notify("Skip Product", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabProduct:CreateText({
+    name = "Prioritas Product",
+    text = "1. Diminta pelanggan (hijau)  2. Views terbesar  3. Dropdown manual  4. Skip",
+})
+
+tabVideo:CreateToggle({
+    name = "Auto Post Video",
+    description = "Saat video ClipTok siap, langsung POST dan tutup layar hasil.",
+    value = false,
+    flag = "AutoPostVideo",
+    forgetState = true,
+    callback = function(value)
+        autoPost = value
+        notify("Auto Post", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabVideo:CreateToggle({
+    name = "Auto Skip Video",
+    description = "Discard video ClipTok supaya lanjut ke customer berikutnya.",
+    value = false,
+    flag = "SkipVideo",
+    forgetState = true,
+    callback = function(value)
+        skipVideo = value
+        notify("Skip Video", value and "ON" or "OFF", 2)
+    end,
+})
+
+tabVideo:CreateText({
+    name = "Catatan Video",
+    text = "Auto Post diprioritaskan kalau dua toggle video sama-sama ON.",
+})
